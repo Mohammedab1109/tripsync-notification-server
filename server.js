@@ -1,32 +1,55 @@
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
+const admin = require('firebase-admin');
 require('dotenv').config();
 
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Initialize Firebase Admin SDK
+let firebaseInitialized = false;
+try {
+  // For production, set FIREBASE_SERVICE_ACCOUNT_KEY environment variable
+  const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT_KEY 
+    ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT_KEY)
+    : require('./firebase-service-account.json'); // For local development
+  
+  admin.initializeApp({
+    credential: admin.credential.cert(serviceAccount),
+    databaseURL: process.env.FIREBASE_DATABASE_URL || "https://exp-proj5-kareem-default-rtdb.firebaseio.com"
+  });
+  
+  firebaseInitialized = true;
+  console.log('✅ Firebase Admin SDK initialized');
+} catch (error) {
+  console.error('❌ Firebase Admin SDK initialization failed:', error);
+  console.log('⚠️ Push notifications will not work without Firebase Admin SDK');
+}
 
 // Middleware
 app.use(helmet());
 app.use(cors());
 app.use(express.json({ limit: '10mb' }));
 
-// Store for active connections (for real-time notifications)
-const activeConnections = new Map();
+// Store for device FCM tokens
+const deviceTokens = new Map(); // userId -> Map(deviceId -> fcmToken)
+const activeConnections = new Map(); // Keep for backward compatibility
 
 // Health check endpoint
 app.get('/', (req, res) => {
   res.json({ 
     message: 'TripSync Notification Server is running!',
     timestamp: new Date().toISOString(),
-    connections: activeConnections.size
+    connections: activeConnections.size,
+    firebaseInitialized: firebaseInitialized
   });
 });
 
 // Register device for notifications
 app.post('/register-device', (req, res) => {
   try {
-    const { userId, deviceId, platform } = req.body;
+    const { userId, deviceId, platform, fcmToken } = req.body;
     
     if (!userId || !deviceId) {
       return res.status(400).json({ error: 'userId and deviceId are required' });
@@ -40,10 +63,19 @@ app.post('/register-device', (req, res) => {
     activeConnections.get(userId).set(deviceId, {
       platform,
       lastSeen: new Date(),
-      active: true
+      active: true,
+      fcmToken: fcmToken || null
     });
 
-    console.log(`✅ Device registered: ${deviceId} for user ${userId}`);
+    // Store FCM token if provided
+    if (fcmToken) {
+      if (!deviceTokens.has(userId)) {
+        deviceTokens.set(userId, new Map());
+      }
+      deviceTokens.get(userId).set(deviceId, fcmToken);
+    }
+
+    console.log(`✅ Device registered: ${deviceId} for user ${userId} ${fcmToken ? '(with FCM token)' : ''}`);
     
     res.json({ 
       success: true, 
@@ -72,20 +104,70 @@ app.post('/send-notification', async (req, res) => {
       return res.status(400).json({ error: 'userId, title, and body are required' });
     }
 
-    // Get user's devices
+    // Get user's FCM tokens
+    const userTokens = deviceTokens.get(userId);
+    let sentCount = 0;
+    
+    if (userTokens && userTokens.size > 0 && firebaseInitialized) {
+      // Send Firebase push notifications
+      const tokens = Array.from(userTokens.values());
+      
+      const message = {
+        notification: {
+          title: title,
+          body: body,
+        },
+        data: {
+          type: type,
+          ...data
+        },
+        tokens: tokens
+      };
+
+      try {
+        const response = await admin.messaging().sendMulticast(message);
+        sentCount = response.successCount;
+        
+        console.log(`✅ Firebase push notification sent to ${sentCount} devices for user: ${userId}`);
+        
+        // Handle failed tokens
+        if (response.failureCount > 0) {
+          response.responses.forEach((resp, idx) => {
+            if (!resp.success) {
+              console.error(`❌ Failed to send to token ${idx}:`, resp.error);
+              // Remove invalid tokens
+              if (resp.error?.code === 'messaging/registration-token-not-registered') {
+                const tokenToRemove = tokens[idx];
+                for (const [deviceId, token] of userTokens.entries()) {
+                  if (token === tokenToRemove) {
+                    userTokens.delete(deviceId);
+                    break;
+                  }
+                }
+              }
+            }
+          });
+        }
+      } catch (firebaseError) {
+        console.error('❌ Firebase messaging error:', firebaseError);
+      }
+    } else {
+      console.log(`⚠️ No FCM tokens or Firebase not initialized for user: ${userId}`);
+    }
+
+    // Get user's devices for fallback
     const userDevices = activeConnections.get(userId);
     
     if (!userDevices || userDevices.size === 0) {
       console.log(`⚠️ No active devices for user: ${userId}`);
       return res.json({ 
         success: true, 
-        message: 'No active devices found for user',
-        sentToDevices: 0
+        message: sentCount > 0 ? `Push notification sent to ${sentCount} devices` : 'No active devices found for user',
+        sentToDevices: sentCount
       });
     }
 
-    // Send to all user's devices
-    let sentCount = 0;
+    // Send to all user's devices (fallback/additional)
     const notifications = [];
 
     for (const [deviceId, deviceInfo] of userDevices.entries()) {
