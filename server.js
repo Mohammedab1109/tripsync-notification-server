@@ -181,7 +181,7 @@ app.post('/send-notification', async (req, res) => {
           data: message.data
         });
         
-        const response = await admin.messaging().sendMulticast(message);
+        const response = await admin.messaging().sendEachForMulticast(message);
         sentCount = response.successCount;
         
         console.log(`✅ Firebase push notification sent to ${sentCount} devices for user: ${userId}`);
@@ -363,7 +363,7 @@ app.post('/send-bulk-notification', async (req, res) => {
         };
 
         try {
-          const response = await admin.messaging().sendMulticast(message);
+          const response = await admin.messaging().sendEachForMulticast(message);
           totalSent += response.successCount;
           
           console.log(`✅ Batch FCM notification sent to ${response.successCount} devices`);
