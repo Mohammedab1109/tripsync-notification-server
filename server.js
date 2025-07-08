@@ -73,6 +73,10 @@ app.post('/register-device', (req, res) => {
         deviceTokens.set(userId, new Map());
       }
       deviceTokens.get(userId).set(deviceId, fcmToken);
+      console.log(`📱 FCM token stored for user ${userId}, device ${deviceId}`);
+      console.log(`📱 Token preview: ${fcmToken.substring(0, 20)}...${fcmToken.substring(fcmToken.length - 20)}`);
+    } else {
+      console.log(`⚠️ No FCM token provided for user ${userId}, device ${deviceId}`);
     }
 
     console.log(`✅ Device registered: ${deviceId} for user ${userId} ${fcmToken ? '(with FCM token)' : ''}`);
@@ -114,36 +118,35 @@ app.post('/send-notification', async (req, res) => {
       
       // Convert data to strings (FCM requirement)
       const stringifiedData = {};
-      if (data) {
+      if (data && typeof data === 'object') {
         Object.keys(data).forEach(key => {
-          stringifiedData[key] = String(data[key]);
+          if (data[key] !== null && data[key] !== undefined) {
+            stringifiedData[key] = String(data[key]);
+          }
         });
       }
+      
+      // Add required fields
+      stringifiedData['type'] = String(type);
+      stringifiedData['click_action'] = 'FLUTTER_NOTIFICATION_CLICK';
       
       const message = {
         notification: {
           title: title,
           body: body,
         },
-        data: {
-          type: String(type),
-          ...stringifiedData
-        },
+        data: stringifiedData,
         tokens: tokens,
         android: {
           notification: {
             icon: 'ic_launcher',
-            color: '#FF6B35',
+            color: '#4EA897',
             channelId: 'tripsync_notifications',
             priority: 'high',
             defaultSound: true,
             defaultVibrateTimings: true,
           },
-          data: {
-            click_action: 'FLUTTER_NOTIFICATION_CLICK',
-            type: String(type),
-            ...stringifiedData
-          }
+          data: stringifiedData
         },
         apns: {
           payload: {
@@ -161,22 +164,43 @@ app.post('/send-notification', async (req, res) => {
       };
 
       try {
+        // Validate tokens before sending
+        const validTokens = tokens.filter(token => token && token.length > 0);
+        if (validTokens.length === 0) {
+          console.log('⚠️ No valid FCM tokens found for user:', userId);
+          return;
+        }
+        
+        // Update message with valid tokens
+        message.tokens = validTokens;
+        
+        console.log(`📡 Sending FCM message to ${validTokens.length} tokens...`);
+        console.log('📱 Message preview:', {
+          title: message.notification.title,
+          body: message.notification.body,
+          data: message.data
+        });
+        
         const response = await admin.messaging().sendMulticast(message);
         sentCount = response.successCount;
         
         console.log(`✅ Firebase push notification sent to ${sentCount} devices for user: ${userId}`);
-        console.log(`📱 Notification: "${title}" - "${body}"`);
+        console.log(`📱 Success: ${response.successCount}, Failed: ${response.failureCount}`);
         
         // Handle failed tokens
         if (response.failureCount > 0) {
           console.log(`❌ Failed to send to ${response.failureCount} devices`);
           response.responses.forEach((resp, idx) => {
             if (!resp.success) {
-              console.error(`❌ Failed to send to token ${idx}:`, resp.error);
+              const errorCode = resp.error?.code || 'unknown';
+              const errorMessage = resp.error?.message || 'Unknown error';
+              console.error(`❌ Token ${idx} failed: ${errorCode} - ${errorMessage}`);
+              
               // Remove invalid tokens
-              if (resp.error?.code === 'messaging/registration-token-not-registered' ||
-                  resp.error?.code === 'messaging/invalid-registration-token') {
-                const tokenToRemove = tokens[idx];
+              if (errorCode === 'messaging/registration-token-not-registered' ||
+                  errorCode === 'messaging/invalid-registration-token' ||
+                  errorCode === 'messaging/invalid-argument') {
+                const tokenToRemove = validTokens[idx];
                 for (const [deviceId, token] of userTokens.entries()) {
                   if (token === tokenToRemove) {
                     userTokens.delete(deviceId);
@@ -190,6 +214,11 @@ app.post('/send-notification', async (req, res) => {
         }
       } catch (firebaseError) {
         console.error('❌ Firebase messaging error:', firebaseError);
+        console.error('❌ Error details:', {
+          code: firebaseError.code,
+          message: firebaseError.message,
+          details: firebaseError.details
+        });
       }
     } else {
       console.log(`⚠️ No FCM tokens or Firebase not initialized for user: ${userId}`);
