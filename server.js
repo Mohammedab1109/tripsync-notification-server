@@ -112,16 +112,52 @@ app.post('/send-notification', async (req, res) => {
       // Send Firebase push notifications
       const tokens = Array.from(userTokens.values());
       
+      // Convert data to strings (FCM requirement)
+      const stringifiedData = {};
+      if (data) {
+        Object.keys(data).forEach(key => {
+          stringifiedData[key] = String(data[key]);
+        });
+      }
+      
       const message = {
         notification: {
           title: title,
           body: body,
         },
         data: {
-          type: type,
-          ...data
+          type: String(type),
+          ...stringifiedData
         },
-        tokens: tokens
+        tokens: tokens,
+        android: {
+          notification: {
+            icon: 'ic_launcher',
+            color: '#FF6B35',
+            channelId: 'tripsync_notifications',
+            priority: 'high',
+            defaultSound: true,
+            defaultVibrateTimings: true,
+          },
+          data: {
+            click_action: 'FLUTTER_NOTIFICATION_CLICK',
+            type: String(type),
+            ...stringifiedData
+          }
+        },
+        apns: {
+          payload: {
+            aps: {
+              alert: {
+                title: title,
+                body: body,
+              },
+              badge: 1,
+              sound: 'default',
+              category: 'GENERAL',
+            },
+          },
+        },
       };
 
       try {
@@ -129,18 +165,22 @@ app.post('/send-notification', async (req, res) => {
         sentCount = response.successCount;
         
         console.log(`✅ Firebase push notification sent to ${sentCount} devices for user: ${userId}`);
+        console.log(`📱 Notification: "${title}" - "${body}"`);
         
         // Handle failed tokens
         if (response.failureCount > 0) {
+          console.log(`❌ Failed to send to ${response.failureCount} devices`);
           response.responses.forEach((resp, idx) => {
             if (!resp.success) {
               console.error(`❌ Failed to send to token ${idx}:`, resp.error);
               // Remove invalid tokens
-              if (resp.error?.code === 'messaging/registration-token-not-registered') {
+              if (resp.error?.code === 'messaging/registration-token-not-registered' ||
+                  resp.error?.code === 'messaging/invalid-registration-token') {
                 const tokenToRemove = tokens[idx];
                 for (const [deviceId, token] of userTokens.entries()) {
                   if (token === tokenToRemove) {
                     userTokens.delete(deviceId);
+                    console.log(`🗑️ Removed invalid token for device: ${deviceId}`);
                     break;
                   }
                 }
@@ -223,6 +263,115 @@ app.post('/send-bulk-notification', async (req, res) => {
     let totalSent = 0;
     const results = [];
 
+    // Collect all FCM tokens for bulk sending
+    const allTokens = [];
+    const tokenUserMap = new Map(); // token -> userId
+
+    for (const userId of userIds) {
+      const userTokens = deviceTokens.get(userId);
+      if (userTokens && userTokens.size > 0) {
+        const tokens = Array.from(userTokens.values());
+        tokens.forEach(token => {
+          allTokens.push(token);
+          tokenUserMap.set(token, userId);
+        });
+      }
+    }
+
+    // Send FCM notifications in batches (FCM allows up to 500 tokens per request)
+    if (allTokens.length > 0 && firebaseInitialized) {
+      const batchSize = 500;
+      
+      for (let i = 0; i < allTokens.length; i += batchSize) {
+        const tokenBatch = allTokens.slice(i, i + batchSize);
+        
+        // Convert data to strings (FCM requirement)
+        const stringifiedData = {};
+        if (data) {
+          Object.keys(data).forEach(key => {
+            stringifiedData[key] = String(data[key]);
+          });
+        }
+        
+        const message = {
+          notification: {
+            title: title,
+            body: body,
+          },
+          data: {
+            type: String(type),
+            ...stringifiedData
+          },
+          tokens: tokenBatch,
+          android: {
+            notification: {
+              icon: 'ic_launcher',
+              color: '#FF6B35',
+              channelId: 'tripsync_notifications',
+              priority: 'high',
+              defaultSound: true,
+              defaultVibrateTimings: true,
+            },
+            data: {
+              click_action: 'FLUTTER_NOTIFICATION_CLICK',
+              type: String(type),
+              ...stringifiedData
+            }
+          },
+          apns: {
+            payload: {
+              aps: {
+                alert: {
+                  title: title,
+                  body: body,
+                },
+                badge: 1,
+                sound: 'default',
+                category: 'GENERAL',
+              },
+            },
+          },
+        };
+
+        try {
+          const response = await admin.messaging().sendMulticast(message);
+          totalSent += response.successCount;
+          
+          console.log(`✅ Batch FCM notification sent to ${response.successCount} devices`);
+          
+          // Handle failed tokens
+          if (response.failureCount > 0) {
+            response.responses.forEach((resp, idx) => {
+              if (!resp.success) {
+                console.error(`❌ Failed to send to token ${idx}:`, resp.error);
+                // Remove invalid tokens
+                if (resp.error?.code === 'messaging/registration-token-not-registered' ||
+                    resp.error?.code === 'messaging/invalid-registration-token') {
+                  const tokenToRemove = tokenBatch[idx];
+                  const userId = tokenUserMap.get(tokenToRemove);
+                  if (userId) {
+                    const userTokens = deviceTokens.get(userId);
+                    if (userTokens) {
+                      for (const [deviceId, token] of userTokens.entries()) {
+                        if (token === tokenToRemove) {
+                          userTokens.delete(deviceId);
+                          console.log(`🗑️ Removed invalid token for user ${userId}, device: ${deviceId}`);
+                          break;
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            });
+          }
+        } catch (firebaseError) {
+          console.error('❌ Firebase bulk messaging error:', firebaseError);
+        }
+      }
+    }
+
+    // Legacy device tracking for fallback
     for (const userId of userIds) {
       const userDevices = activeConnections.get(userId);
       
@@ -241,7 +390,6 @@ app.post('/send-bulk-notification', async (req, res) => {
           };
 
           results.push(notification);
-          totalSent++;
         }
       }
     }
